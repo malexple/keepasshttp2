@@ -1,13 +1,13 @@
-// TCP -> WebSocket handshake -> frame echo server.
+// TCP -> WebSocket handshake -> frame echo server, with protocol-level
+// conformance: ping/pong and close handshake per RFC 6455.
+//
 // Building blocks verified in isolation first:
 //   - accept-loop + line reading: tcp_probe.zig
 //   - Sec-WebSocket-Accept (SHA1+Base64): ws_accept_test.zig
 //   - frame decode/encode logic: ws_frame_test.zig
 //
-// NOTE: take(n) blocks until exactly n bytes are available, it does NOT
-// return "whatever is available up to n". So frames must be read in
-// exact-size steps (header -> extended length -> mask -> payload),
-// never with one oversized take() call.
+// NOTE: take(n) blocks until exactly n bytes are available, so frames are
+// read in exact-size steps (header -> extended length -> mask -> payload).
 
 const std = @import("std");
 
@@ -19,6 +19,17 @@ fn buildFrame(out: []u8, opcode: u4, payload: []const u8) ![]u8 {
     out[1] = @intCast(payload.len);
     @memcpy(out[2 .. 2 + payload.len], payload);
     return out[0 .. 2 + payload.len];
+}
+
+fn sendClose(writer: anytype, code: u16, reason: []const u8) !void {
+    var payload_buf: [125]u8 = undefined;
+    std.mem.writeInt(u16, payload_buf[0..2], code, .big);
+    @memcpy(payload_buf[2 .. 2 + reason.len], reason);
+
+    var out_buf: [128]u8 = undefined;
+    const frame = try buildFrame(&out_buf, 0x8, payload_buf[0 .. 2 + reason.len]);
+    try writer.interface.writeAll(frame);
+    try writer.interface.flush();
 }
 
 pub fn main() !void {
@@ -99,7 +110,7 @@ pub fn main() !void {
 
         std.debug.print("Sent 101 response, Accept: {s}\n", .{accept});
 
-        // --- WebSocket frame echo loop ---
+        // --- WebSocket frame loop ---
         var frame_read_buf: [4096]u8 = undefined;
         var frame_reader = stream.reader(io, &frame_read_buf);
 
@@ -130,17 +141,24 @@ pub fn main() !void {
                 payload_len = std.mem.readInt(u64, ext[0..8], .big);
             }
 
-            var mask_key: [4]u8 = undefined;
-            if (masked) {
-                const mk = frame_reader.interface.take(4) catch |err| {
-                    std.debug.print("frame read error (mask): {}\n", .{err});
-                    break :conn;
-                };
-                @memcpy(&mask_key, mk);
+            // RFC 6455 5.1: the server MUST close the connection upon
+            // receiving a non-masked frame from a client.
+            if (!masked) {
+                std.debug.print("protocol error: unmasked frame from client\n", .{});
+                sendClose(&writer, 1002, "expected masked frame") catch {};
+                break :conn;
             }
+
+            var mask_key: [4]u8 = undefined;
+            const mk = frame_reader.interface.take(4) catch |err| {
+                std.debug.print("frame read error (mask): {}\n", .{err});
+                break :conn;
+            };
+            @memcpy(&mask_key, mk);
 
             if (payload_len > 4096) {
                 std.debug.print("payload too large for demo: {}\n", .{payload_len});
+                sendClose(&writer, 1009, "message too big") catch {};
                 break :conn;
             }
 
@@ -152,27 +170,45 @@ pub fn main() !void {
                     std.debug.print("frame read error (payload): {}\n", .{err});
                     break :conn;
                 };
-                if (masked) {
-                    for (raw, 0..) |b, i| decode_buf[i] = b ^ mask_key[i % 4];
-                } else {
-                    @memcpy(decode_buf[0..payload_len_usize], raw);
-                }
+                for (raw, 0..) |b, i| decode_buf[i] = b ^ mask_key[i % 4];
                 payload = decode_buf[0..payload_len_usize];
             }
 
-            std.debug.print("FRAME opcode={} fin={} payload=\"{s}\"\n", .{ opcode, fin, payload });
+            std.debug.print("FRAME opcode={} fin={} len={}\n", .{ opcode, fin, payload_len_usize });
 
-            if (opcode == 0x8) {
-                std.debug.print("received close frame\n", .{});
-                break :conn;
-            }
-
-            if (opcode == 0x1) {
-                var echo_buf: [4096]u8 = undefined;
-                const echo_frame = try buildFrame(&echo_buf, 0x1, payload);
-                try writer.interface.writeAll(echo_frame);
-                try writer.interface.flush();
-                std.debug.print("echoed back \"{s}\"\n", .{payload});
+            switch (opcode) {
+                0x1 => { // text
+                    std.debug.print("payload=\"{s}\"\n", .{payload});
+                    var echo_buf: [4096]u8 = undefined;
+                    const echo_frame = try buildFrame(&echo_buf, 0x1, payload);
+                    try writer.interface.writeAll(echo_frame);
+                    try writer.interface.flush();
+                    std.debug.print("echoed back \"{s}\"\n", .{payload});
+                },
+                0x8 => { // close
+                    std.debug.print("received close frame, replying and closing\n", .{});
+                    if (payload.len >= 2) {
+                        const code = std.mem.readInt(u16, payload[0..2], .big);
+                        std.debug.print("close code={} reason=\"{s}\"\n", .{ code, payload[2..] });
+                        sendClose(&writer, code, "") catch {};
+                    } else {
+                        sendClose(&writer, 1000, "") catch {};
+                    }
+                    break :conn;
+                },
+                0x9 => { // ping -> must reply with pong carrying same payload
+                    std.debug.print("received ping, sending pong\n", .{});
+                    var pong_buf: [128]u8 = undefined;
+                    const pong_frame = try buildFrame(&pong_buf, 0xA, payload);
+                    try writer.interface.writeAll(pong_frame);
+                    try writer.interface.flush();
+                },
+                0xA => { // unsolicited pong -> ignore
+                    std.debug.print("received pong, ignoring\n", .{});
+                },
+                else => {
+                    std.debug.print("unhandled opcode {}, ignoring\n", .{opcode});
+                },
             }
         }
     }

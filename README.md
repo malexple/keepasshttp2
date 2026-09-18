@@ -69,3 +69,11 @@ echoed back "hello"
 OPEN
 MSG: hello
 ```
+
+## python websocket client ws_test_client.py
+
+pip install websockets
+python ws_test_client.py
+
+python -m pip install websockets
+python ws_test_client.py
