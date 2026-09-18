@@ -1,5 +1,6 @@
 // TCP -> WebSocket handshake -> frame echo server, with protocol-level
-// conformance: ping/pong and close handshake per RFC 6455.
+// conformance (ping/pong, close handshake) and Origin validation to block
+// cross-site WebSocket hijacking from arbitrary web pages.
 //
 // Building blocks verified in isolation first:
 //   - accept-loop + line reading: tcp_probe.zig
@@ -10,6 +11,26 @@
 // read in exact-size steps (header -> extended length -> mask -> payload).
 
 const std = @import("std");
+
+// Official KeePassXC-Browser extension on the Chrome Web Store.
+// Add any dev/unpacked extension ID here too while testing locally.
+const allowed_chrome_origins = [_][]const u8{
+    "chrome-extension://oboonakemofpalcgghocfoadofidjkkk",
+};
+
+// Firefox assigns a random per-install UUID to moz-extension:// URLs
+// specifically so it *cannot* be hardcoded or used for fingerprinting.
+// A malicious web page's JS cannot spoof this scheme regardless, so
+// accepting any moz-extension:// origin is sufficient to block the
+// cross-site WebSocket hijacking threat this check exists for.
+const moz_extension_prefix = "moz-extension://";
+
+fn isOriginAllowed(origin: []const u8) bool {
+    for (allowed_chrome_origins) |allowed| {
+        if (std.mem.eql(u8, origin, allowed)) return true;
+    }
+    return std.mem.startsWith(u8, origin, moz_extension_prefix);
+}
 
 fn buildFrame(out: []u8, opcode: u4, payload: []const u8) ![]u8 {
     if (payload.len > 125) return error.PayloadTooLargeForTest;
@@ -55,6 +76,8 @@ pub fn main() !void {
 
         var ws_key_buf: [256]u8 = undefined;
         var ws_key_len: usize = 0;
+        var origin_buf: [256]u8 = undefined;
+        var origin_len: usize = 0;
 
         while (true) {
             const maybe_line = reader.interface.takeDelimiter('\n') catch |err| {
@@ -72,11 +95,18 @@ pub fn main() !void {
                 break;
             }
 
-            const prefix = "Sec-WebSocket-Key: ";
-            if (std.mem.startsWith(u8, trimmed, prefix)) {
-                const value = trimmed[prefix.len..];
+            const key_prefix = "Sec-WebSocket-Key: ";
+            if (std.mem.startsWith(u8, trimmed, key_prefix)) {
+                const value = trimmed[key_prefix.len..];
                 @memcpy(ws_key_buf[0..value.len], value);
                 ws_key_len = value.len;
+            }
+
+            const origin_prefix = "Origin: ";
+            if (std.mem.startsWith(u8, trimmed, origin_prefix)) {
+                const value = trimmed[origin_prefix.len..];
+                @memcpy(origin_buf[0..value.len], value);
+                origin_len = value.len;
             }
         }
 
@@ -84,6 +114,19 @@ pub fn main() !void {
             std.debug.print("No Sec-WebSocket-Key found, skipping\n", .{});
             continue;
         }
+
+        const origin = origin_buf[0..origin_len];
+        if (origin_len == 0 or !isOriginAllowed(origin)) {
+            std.debug.print("REJECTED origin: \"{s}\"\n", .{origin});
+            var write_buf: [256]u8 = undefined;
+            var writer = stream.writer(io, &write_buf);
+            const forbidden = "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n";
+            writer.interface.writeAll(forbidden) catch {};
+            writer.interface.flush() catch {};
+            continue;
+        }
+        std.debug.print("Origin allowed: \"{s}\"\n", .{origin});
+
         const key = ws_key_buf[0..ws_key_len];
 
         const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";

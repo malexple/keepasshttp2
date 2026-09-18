@@ -3,6 +3,9 @@ Manual WebSocket protocol test client for ws_handshake.zig.
 Explicitly drives ping and close so we can see the server's
 "received ping, sending pong" / "received close frame..." log lines.
 
+Also sends a legitimate extension Origin, since ws_handshake.zig now
+rejects connections without an allowed Origin header (403 + close).
+
 Install: pip install websockets
 Run:     python ws_test_client.py
 """
@@ -10,10 +13,12 @@ Run:     python ws_test_client.py
 import asyncio
 import websockets
 
+ALLOWED_ORIGIN = "chrome-extension://oboonakemofpalcgghocfoadofidjkkk"
+
 
 async def main():
     uri = "ws://127.0.0.1:19455/"
-    async with websockets.connect(uri) as ws:
+    async with websockets.connect(uri, origin=ALLOWED_ORIGIN) as ws:
         print("Connected")
 
         await ws.send("hello")
