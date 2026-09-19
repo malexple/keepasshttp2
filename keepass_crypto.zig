@@ -4,22 +4,10 @@
 // Design: synchronous, blocking, poll-style API. No callbacks cross the
 // P/Invoke boundary. C# drives the loop itself:
 //   kp2_ws_listen -> kp2_ws_accept -> loop { kp2_ws_recv, kp2_ws_send } -> kp2_ws_close
-//
-// kp2_ws_recv transparently answers ping/close frames internally (per
-// RFC 6455) and only ever returns to the caller when a text frame arrives,
-// or 0/negative to signal connection closed/error.
-//
-// Handshake logic (line reading, Sec-WebSocket-Accept, Origin validation)
-// and frame logic (mask/unmask, ping/pong, close) are carried over from
-// ws_handshake.zig, verified against real browsers earlier in this project.
-// Crypto logic carried over from keepass_crypto.zig (Box.seal/open),
-// verified against a real libsodium (PyNaCl) vector.
 
 const std = @import("std");
 const Box = std.crypto.nacl.Box;
 
-// Official KeePassXC-Browser extension on the Chrome Web Store.
-// Add any dev/unpacked extension ID here too while testing locally.
 const allowed_chrome_origins = [_][]const u8{
     "chrome-extension://oboonakemofpalcgghocfoadofidjkkk",
 };
@@ -41,11 +29,6 @@ fn buildFrame(out: []u8, opcode: u4, payload: []const u8) ![]u8 {
     return out[0 .. 2 + payload.len];
 }
 
-// --- Global state: one listening server + a small fixed table of
-// connections. A local single-user KeePass plugin has no need to support
-// more than a handful of concurrent connections, so a fixed array avoids
-// dynamic allocation entirely. ---
-
 const max_connections = 8;
 
 var g_io_threaded: ?std.Io.Threaded = null;
@@ -63,13 +46,13 @@ const Connection = struct {
 var g_connections: [max_connections]Connection = undefined;
 
 fn io() std.Io {
+    if (g_io_threaded == null) {
+        g_io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    }
     return g_io_threaded.?.io();
 }
 
 export fn kp2_ws_listen(port: u16) callconv(.c) i32 {
-    if (g_io_threaded == null) {
-        g_io_threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
-    }
     const addr = std.Io.net.IpAddress.parse("127.0.0.1", port) catch return -1;
     g_server = addr.listen(io(), .{}) catch return -2;
     for (&g_connections) |*c| c.in_use = false;
@@ -81,11 +64,6 @@ export fn kp2_ws_shutdown() callconv(.c) void {
     g_server = null;
 }
 
-// Blocks until a client connects and completes the WebSocket handshake
-// (including Origin validation). Returns a connection handle >= 0, or a
-// negative error code:
-//   -1 no free connection slot, -2 accept failed, -3 no Sec-WebSocket-Key,
-//   -4 Origin missing/rejected, -5 handshake write failed
 export fn kp2_ws_accept() callconv(.c) i32 {
     const server = &(g_server orelse return -2);
 
@@ -184,9 +162,6 @@ fn connFromHandle(handle: i32) ?*Connection {
     return conn;
 }
 
-// Blocks until a text frame arrives (transparently answering ping/close).
-// Returns number of bytes written into out_buf, 0 if the connection was
-// closed (by peer or protocol error), or a negative error code.
 export fn kp2_ws_recv(handle: i32, out_buf: [*]u8, out_buf_len: usize) callconv(.c) i32 {
     const conn = connFromHandle(handle) orelse return -1;
 
@@ -207,7 +182,7 @@ export fn kp2_ws_recv(handle: i32, out_buf: [*]u8, out_buf_len: usize) callconv(
             payload_len = std.mem.readInt(u64, ext[0..8], .big);
         }
 
-        if (!masked) return closeAndReturn(conn, 0); // protocol error, RFC 6455 5.1
+        if (!masked) return closeAndReturn(conn, 0);
 
         var mask_key: [4]u8 = undefined;
         const mk = conn.reader.interface.take(4) catch return closeAndReturn(conn, 0);
@@ -222,15 +197,15 @@ export fn kp2_ws_recv(handle: i32, out_buf: [*]u8, out_buf_len: usize) callconv(
         }
 
         switch (opcode) {
-            0x1 => return @intCast(payload_len_usize), // text: hand off to caller
-            0x8 => return closeAndReturn(conn, 0), // close
-            0x9 => { // ping -> pong, keep looping
+            0x1 => return @intCast(payload_len_usize),
+            0x8 => return closeAndReturn(conn, 0),
+            0x9 => {
                 var pong_buf: [128]u8 = undefined;
-            const pong_frame = buildFrame(&pong_buf, 0xA, out_buf[0..payload_len_usize]) catch continue;
-            conn.writer.interface.writeAll(pong_frame) catch return closeAndReturn(conn, 0);
-            conn.writer.interface.flush() catch return closeAndReturn(conn, 0);
-        },
-            else => {}, // pong or unknown control/continuation: ignore, keep looping
+                const pong_frame = buildFrame(&pong_buf, 0xA, out_buf[0..payload_len_usize]) catch continue;
+                conn.writer.interface.writeAll(pong_frame) catch return closeAndReturn(conn, 0);
+                conn.writer.interface.flush() catch return closeAndReturn(conn, 0);
+            },
+            else => {},
         }
     }
 }
@@ -241,10 +216,9 @@ fn closeAndReturn(conn: *Connection, value: i32) i32 {
     return value;
 }
 
-// Sends `buf` as a single text frame. Returns 0 on success, negative on error.
 export fn kp2_ws_send(handle: i32, buf: [*]const u8, buf_len: usize) callconv(.c) i32 {
     const conn = connFromHandle(handle) orelse return -1;
-    if (buf_len > 8192 - 10) return -2; // fits within write_buf with frame header room
+    if (buf_len > 8192 - 10) return -2;
 
     var frame_buf: [8192]u8 = undefined;
     const frame = buildTextFrame(&frame_buf, buf[0..buf_len]) catch return -3;
@@ -254,8 +228,6 @@ export fn kp2_ws_send(handle: i32, buf: [*]const u8, buf_len: usize) callconv(.c
     return 0;
 }
 
-// buildFrame() only supports control-frame-sized (<=125 byte) payloads;
-// text messages need the extended 16-bit length form too.
 fn buildTextFrame(out: []u8, payload: []const u8) ![]u8 {
     if (payload.len <= 125) return buildFrame(out, 0x1, payload);
     if (payload.len > 65535) return error.PayloadTooLarge;
@@ -280,7 +252,7 @@ export fn kp2_ws_close(handle: i32) callconv(.c) void {
     _ = closeAndReturn(conn, 0);
 }
 
-// --- Crypto exports, unchanged from the earlier isolated version ---
+// --- Crypto exports ---
 
 export fn kp2_box_open(
     ciphertext: [*]const u8,
@@ -345,4 +317,16 @@ export fn kp2_box_seal(
 
 export fn kp2_secure_zero(buf: [*]u8, len: usize) callconv(.c) void {
     std.crypto.secureZero(u8, buf[0..len]);
+}
+
+// Generates a fresh X25519 keypair for the host side of the key exchange.
+// Written to out_public/out_secret, which must each be exactly 32 bytes.
+export fn kp2_generate_keypair(out_public: [*]u8, out_public_len: usize, out_secret: [*]u8, out_secret_len: usize) callconv(.c) i32 {
+    if (out_public_len != Box.public_length) return -1;
+    if (out_secret_len != Box.secret_length) return -2;
+
+    const kp = Box.KeyPair.generate(io());
+    @memcpy(out_public[0..Box.public_length], &kp.public_key);
+    @memcpy(out_secret[0..Box.secret_length], &kp.secret_key);
+    return 0;
 }
