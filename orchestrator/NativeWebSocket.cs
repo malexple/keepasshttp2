@@ -55,7 +55,11 @@ public static class NativeWebSocket
             }
         }
         if (n <= 0) return null;
-        return buf[..n];
+
+        // net48 has no System.Index/System.Range (buf[..n]); copy explicitly.
+        var result = new byte[n];
+        Array.Copy(buf, result, n);
+        return result;
     }
 
     public static void Send(int handle, byte[] payload)
