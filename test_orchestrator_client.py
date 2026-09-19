@@ -42,7 +42,7 @@ async def main():
         host_pk = base64.b64decode(resp1["publicKey"])
 
         # 2. get-logins (encrypted)
-        inner = {"action": "get-logins", "url": "https://example.com", "submitUrl": "https://example.com/login"}
+        inner = {"action": "get-logins", "url": "https://keepass.info/", "submitUrl": "https://example.com/login"}
         inner_bytes = json.dumps(inner).encode()
         nonce2 = os.urandom(24)
         ciphertext = nb.crypto_box(inner_bytes, nonce2, host_pk, client_sk)

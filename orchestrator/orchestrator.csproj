@@ -1,12 +1,27 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <OutputType>Exe</OutputType>
+    <OutputType>Library</OutputType>
     <TargetFramework>net48</TargetFramework>
     <LangVersion>latest</LangVersion>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- KeePass plugin naming convention: DLL file name (without extension)
+         must equal the plugin class's namespace, and the plugin class must
+         be named "<Namespace>Ext". Our plugin class is KeePassHttp2Ext in
+         namespace KeePassHttp2, so the assembly must be named KeePassHttp2. -->
+    <AssemblyName>KeePassHttp2</AssemblyName>
+
+    <!-- KeePass detects plugin DLLs by inspecting this exact field in the
+         file's version info block. Without it, KeePass silently ignores
+         the file - no error, no log entry, nothing. -->
+    <Product>KeePass Plugin</Product>
+    <AssemblyTitle>KeePassHttp2</AssemblyTitle>
+    <Company>dev</Company>
+    <Version>0.1.0</Version>
+    <FileVersion>0.1.0.0</FileVersion>
   </PropertyGroup>
 
   <ItemGroup>
@@ -18,6 +33,7 @@
       <HintPath>D:\program\TC UP\MEDIA\Programs\KeePass\KeePass.exe</HintPath>
       <Private>true</Private>
     </Reference>
+    <Reference Include="System.Windows.Forms" />
   </ItemGroup>
 
 </Project>
