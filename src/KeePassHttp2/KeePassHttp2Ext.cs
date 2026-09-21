@@ -23,7 +23,7 @@
 //
 // Thread-safety: PwDatabase/PwEntry are not thread-safe and are owned by
 // the UI thread. All access to host.Database is marshaled onto the UI
-// thread via host.MainWindow.Invoke(...) from HandleGetLogins.
+// thread via host.MainWindow.Invoke(...).
 //
 // _activeConnection and Terminate(): WebSocketServer.Shutdown() only
 // stops HttpListener from accepting *new* connections (verified in
@@ -35,6 +35,25 @@
 // that aborts the pending ReceiveAsync with ObjectDisposedException,
 // which WebSocketConnection.Receive() already catches and turns into a
 // clean null return, letting ServerLoop's inner loop exit on its own.
+//
+// Trust model (change-public-keys / associate / test-associate):
+// change-public-keys is free for anyone to call - it's just an ephemeral
+// key exchange, no secrets. associate is the actual trust boundary: it
+// pops up AssociateDialog on the KeePass UI thread, and nothing proceeds
+// until a human clicks Allow. Once allowed, the client's permanent
+// identification public key is stored in the open database's CustomData
+// (survives KeePass restarts), and test-associate on a later connection
+// just looks it up and compares - this matches how KeePassXC-Browser
+// itself does it (see keepassxc-protocol.md), including its known
+// limitation that test-associate is a plain key comparison, not a fresh
+// challenge-response proof of possession.
+//
+// associate and test-associate both always send back a real
+// success:true/false response rather than throwing - unlike most of our
+// other error paths, "no database open" and "user declined pairing" are
+// expected, common outcomes here (not protocol violations), and a real
+// client needs an actual answer instead of a silent timeout to decide
+// whether to retry, give up, or prompt the user again.
 
 using System;
 using System.Collections.Generic;
@@ -42,11 +61,13 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
+using Chaos.NaCl;
 using KeePass.Plugins;
 using KeePassHttp2.Crypto;
 using KeePassHttp2.Json;
 using KeePassHttp2.Protocol;
 using KeePassHttp2.Transport;
+using KeePassHttp2.UI;
 using KeePassLib;
 
 namespace KeePassHttp2;
@@ -54,6 +75,8 @@ namespace KeePassHttp2;
 public sealed class KeePassHttp2Ext : Plugin
 {
     private const ushort ListenPort = 19455;
+    private const string ProtocolVersion = "2.0.0-stub";
+    private const string CustomDataKeyPrefix = "KeePassHttp2_";
 
     private IPluginHost? _host;
     private WebSocketServer? _server;
@@ -172,7 +195,7 @@ public sealed class KeePassHttp2Ext : Plugin
             .WriteString("action", "change-public-keys")
             .WriteString("publicKey", Convert.ToBase64String(_hostPublicKey))
             .WriteString("success", "true")
-            .WriteString("version", "2.0.0-stub")
+            .WriteString("version", ProtocolVersion)
             .Build();
 
         SendJson(connection, json);
@@ -202,6 +225,8 @@ public sealed class KeePassHttp2Ext : Plugin
         string innerResponseJson = probe.Action switch
         {
             "get-logins" => HandleGetLogins(innerRoot),
+            "associate" => HandleAssociate(innerRoot, clientPk),
+            "test-associate" => HandleTestAssociate(innerRoot),
             _ => throw new EnvelopeValidationException($"unhandled inner action: {probe.Action}"),
         };
 
@@ -220,6 +245,117 @@ public sealed class KeePassHttp2Ext : Plugin
             .Build();
 
         SendJson(connection, outerJson);
+    }
+
+    private static string FailureResponse() => new JsonObjectWriter()
+        .WriteString("version", ProtocolVersion)
+        .WriteString("success", "false")
+        .Build();
+
+    // The actual trust boundary for the whole protocol: pops up
+    // AssociateDialog on the UI thread and blocks (this is a background
+    // server thread, so blocking here is fine) until the human answers.
+    // Stores the client's permanent identification public key in the open
+    // database's CustomData, keyed by the name the human chose, and saves
+    // immediately so the pairing survives a KeePass restart even if the
+    // user never explicitly saves.
+    private string HandleAssociate(JsonValue innerRoot, byte[] sessionClientPk)
+    {
+        var request = AssociateRequest.Parse(innerRoot);
+
+        if (string.IsNullOrEmpty(request.Key) || string.IsNullOrEmpty(request.IdKey))
+            throw new EnvelopeValidationException("associate: missing key/idKey");
+
+        byte[] claimedSessionKey = ProtocolEnvelopeParser.DecodeFixedLength(
+            request.Key, NaClBox.PublicKeyLength, "associate.key");
+        if (!CryptoBytes.ConstantTimeEquals(claimedSessionKey, sessionClientPk))
+            throw new EnvelopeValidationException("associate: key does not match current session");
+
+        byte[] idKey = ProtocolEnvelopeParser.DecodeFixedLength(
+            request.IdKey!, NaClBox.PublicKeyLength, "associate.idKey");
+
+        PwDatabase? db = null;
+        string? chosenName = null;
+
+        _host!.MainWindow.Invoke(new MethodInvoker(() =>
+        {
+            db = _host.Database;
+            if (db is null || !db.IsOpen) return;
+
+            using var dialog = new AssociateDialog($"KeePassHttp2 client {DateTime.Now:HHmmss}");
+            if (dialog.ShowDialog(_host.MainWindow) != DialogResult.OK) return;
+            if (string.IsNullOrWhiteSpace(dialog.ChosenName)) return;
+
+            chosenName = dialog.ChosenName;
+            db.CustomData.Set(CustomDataKeyPrefix + chosenName, Convert.ToBase64String(idKey));
+            db.Save(null);
+        }));
+
+        if (db is null || !db.IsOpen)
+        {
+            PluginLog.WriteLine("associate: no database open");
+            return FailureResponse();
+        }
+
+        if (chosenName is null)
+        {
+            PluginLog.WriteLine("associate: user declined pairing");
+            return FailureResponse();
+        }
+
+        PluginLog.WriteLine($"associate: paired as '{chosenName}'");
+
+        return new JsonObjectWriter()
+            .WriteString("hash", ComputeDatabaseHash(db))
+            .WriteString("version", ProtocolVersion)
+            .WriteString("success", "true")
+            .WriteString("id", chosenName)
+            .Build();
+    }
+
+    // Always returns a normal response (success: true/false) instead of
+    // throwing - a client testing an association that no longer exists
+    // (different database open, first connection ever, etc.) is an
+    // expected, common case, not a protocol error.
+    private string HandleTestAssociate(JsonValue innerRoot)
+    {
+        var request = TestAssociateRequest.Parse(innerRoot);
+
+        if (string.IsNullOrEmpty(request.Id) || string.IsNullOrEmpty(request.Key))
+            throw new EnvelopeValidationException("test-associate: missing id/key");
+
+        byte[] claimedIdKey = ProtocolEnvelopeParser.DecodeFixedLength(
+            request.Key, NaClBox.PublicKeyLength, "test-associate.key");
+
+        PwDatabase? db = null;
+        string? storedBase64 = null;
+
+        _host!.MainWindow.Invoke(new MethodInvoker(() =>
+        {
+            db = _host.Database;
+            if (db is null || !db.IsOpen) return;
+            storedBase64 = db.CustomData.Get(CustomDataKeyPrefix + request.Id);
+        }));
+
+        bool success = false;
+        if (db is not null && db.IsOpen && storedBase64 is not null)
+        {
+            byte[] storedIdKey = Convert.FromBase64String(storedBase64);
+            success = storedIdKey.Length == claimedIdKey.Length &&
+                       CryptoBytes.ConstantTimeEquals(storedIdKey, claimedIdKey);
+        }
+
+        PluginLog.WriteLine($"test-associate for id={request.Id}: {(success ? "known" : "unknown/mismatch")}");
+
+        if (!success)
+            return FailureResponse();
+
+        return new JsonObjectWriter()
+            .WriteString("version", ProtocolVersion)
+            .WriteString("success", "true")
+            .WriteString("hash", ComputeDatabaseHash(db!))
+            .WriteString("id", request.Id)
+            .Build();
     }
 
     // Runs on the background server thread. All PwDatabase/PwEntry access
@@ -272,6 +408,18 @@ public sealed class KeePassHttp2Ext : Plugin
             .WriteRaw("entries", entriesJson)
             .WriteString("success", "true")
             .Build();
+    }
+
+    // Informational fingerprint of "which database is this" for the
+    // client - stable across saves of the same database (root group UUID
+    // doesn't change), changes if a different database is opened. Not a
+    // security boundary, just a cache-invalidation hint (matches the
+    // "hash" field's role in the real KeePassXC-Browser protocol).
+    private static string ComputeDatabaseHash(PwDatabase db)
+    {
+        using var sha256 = SHA256.Create();
+        byte[] hash = sha256.ComputeHash(db.RootGroup.Uuid.UuidBytes);
+        return Convert.ToBase64String(hash);
     }
 
     private void SendJson(WebSocketConnection connection, string json)

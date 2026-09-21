@@ -32,3 +32,39 @@ public sealed record GetLoginsRequest
         SubmitUrl = root.TryGetString("submitUrl"),
     };
 }
+
+// "key" here is the *session* client public key (the one sent earlier in
+// change-public-keys) - it's a self-attestation the caller includes so we
+// can sanity-check the encrypted associate message really belongs to the
+// session we think it does. "idKey" is the new, permanent identification
+// public key the client wants us to remember it by.
+public sealed record AssociateRequest
+{
+    public string? Action { get; init; }
+    public string? Key { get; init; }
+    public string? IdKey { get; init; }
+
+    public static AssociateRequest Parse(JsonValue root) => new()
+    {
+        Action = root.TryGetString("action"),
+        Key = root.TryGetString("key"),
+        IdKey = root.TryGetString("idKey"),
+    };
+}
+
+// "id" is the association name chosen at associate-time. "key" here is the
+// permanent identification public key (not a session key) - we look up
+// "id" and compare against what we stored for it.
+public sealed record TestAssociateRequest
+{
+    public string? Action { get; init; }
+    public string? Id { get; init; }
+    public string? Key { get; init; }
+
+    public static TestAssociateRequest Parse(JsonValue root) => new()
+    {
+        Action = root.TryGetString("action"),
+        Id = root.TryGetString("id"),
+        Key = root.TryGetString("key"),
+    };
+}
