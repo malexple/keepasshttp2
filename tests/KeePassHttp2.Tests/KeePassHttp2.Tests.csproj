@@ -20,6 +20,14 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
   </ItemGroup>
 
+  <!-- ClientWebSocket lives in this in-box Framework assembly - not a
+       NuGet package, just needs an explicit Reference like
+       System.Windows.Forms did earlier in this project. Used only to
+       drive real handshake/echo tests against our WebSocketServer. -->
+  <ItemGroup>
+    <Reference Include="System.Net.WebSockets.Client" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="..\..\src\KeePassHttp2\KeePassHttp2.csproj" />
   </ItemGroup>
