@@ -17,4 +17,42 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!--
+    Required by KeePass, not optional (see keepass.info/help/v2_dev/plg_index.html,
+    "Plugin Conventions"): KeePass scans the Plugins folder and uses each
+    DLL's file version info Product field to decide whether it's even a
+    candidate plugin. If this isn't exactly "KeePass Plugin", KeePass
+    silently skips the file - no error, it just never shows up in
+    Tools > Plugins. This must stay exactly this string.
+  -->
+  <PropertyGroup>
+    <Product>KeePass Plugin</Product>
+  </PropertyGroup>
+
+  <!--
+    KeePass.exe is not a NuGet package - it ships with the KeePass
+    installation itself, and at runtime the real one must be picked up
+    from KeePass's own folder (hence Private=false: don't copy it into
+    our output directory). Only needed at compile time to resolve the
+    KeePass.Plugins / KeePassLib types.
+
+    Note: this build of KeePass has no separate KeePassLib.dll - KeePassLib
+    is merged into KeePass.exe itself, so one reference covers both
+    namespaces.
+
+    Override KeePassDir if your install lives elsewhere:
+      dotnet build -p:KeePassDir="C:\Path\To\Your\KeePass"
+  -->
+  <PropertyGroup>
+    <KeePassDir Condition="'$(KeePassDir)' == ''">d:\program\TC UP\MEDIA\Programs\KeePass</KeePassDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="KeePass">
+      <HintPath>$(KeePassDir)\KeePass.exe</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="System.Windows.Forms" />
+  </ItemGroup>
+
 </Project>
