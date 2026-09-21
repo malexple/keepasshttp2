@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!--
+    NuGet packages are fine here - this project never ships to a user's
+    KeePass installation, it only runs in the dev/CI environment via
+    `dotnet test`. The "no NuGet" rule applies solely to
+    src/KeePassHttp2/KeePassHttp2.csproj (the actual plugin).
+  -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\KeePassHttp2\KeePassHttp2.csproj" />
+  </ItemGroup>
+
+</Project>

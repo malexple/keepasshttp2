@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    This project must have ZERO PackageReference entries and ZERO native
+    DLL dependencies. That is the entire point of vendoring Chaos.NaCl as
+    source instead of using a NuGet package or the old Zig P/Invoke layer:
+    the built plugin has to be a single self-contained managed DLL, so it
+    can eventually ship as one .plgx with no companion files and no
+    KeePass.exe.config edits.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
