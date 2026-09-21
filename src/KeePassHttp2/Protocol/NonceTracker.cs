@@ -5,7 +5,7 @@
 // bytes long random data"). So this is the universal, default mechanism for
 // every client, not a fallback for clients lacking some optional field.
 //
-// Ordering contract (see NativeCrypto/ProtocolEnvelope callers):
+// Ordering contract (see NaClBox/ProtocolEnvelope callers):
 //   1. Check IsReplay(clientId, nonce) BEFORE attempting decryption — a
 //      cheap rejection of an exact repeated packet, and safe to do first
 //      since the nonce travels in cleartext anyway (checking it first

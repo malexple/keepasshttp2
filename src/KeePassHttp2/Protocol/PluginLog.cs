@@ -14,7 +14,7 @@ internal static class PluginLog
 
     private static readonly string LogPath = Path.Combine(
         Path.GetDirectoryName(typeof(PluginLog).Assembly.Location) ?? ".",
-        "keepasshttp2-orchestrator.log");
+        "keepasshttp2.log");
 
     public static void WriteLine(string message)
     {
