@@ -98,4 +98,47 @@ public class TransportTests
         Assert.True(completed, "Accept() did not unblock within 5 seconds of Shutdown()");
         Assert.Null(acceptTask.Result);
     }
+
+    [Fact]
+    public async Task Server_RejectsDisallowedOrigin()
+    {
+        const ushort port = 19954;
+        using var server = new WebSocketServer();
+        server.Listen(port);
+
+        var acceptTask = Task.Run(() => server.Accept(origin => origin == "https://allowed.example"));
+
+        using var client = new ClientWebSocket();
+        client.Options.SetRequestHeader("Origin", "https://not-allowed.example");
+
+        // A rejected handshake surfaces to the client as a failed
+        // ConnectAsync (403 instead of the expected 101 upgrade), not as
+        // a connection that opens and then gets closed.
+        await Assert.ThrowsAsync<WebSocketException>(
+            () => client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/"), CancellationToken.None));
+
+        var connection = await acceptTask;
+        Assert.Null(connection);
+
+        server.Shutdown();
+    }
+
+    [Fact]
+    public async Task Server_AllowsMatchingOrigin()
+    {
+        const ushort port = 19955;
+        using var server = new WebSocketServer();
+        server.Listen(port);
+
+        var acceptTask = Task.Run(() => server.Accept(origin => origin == "https://allowed.example"));
+
+        using var client = new ClientWebSocket();
+        client.Options.SetRequestHeader("Origin", "https://allowed.example");
+        await client.ConnectAsync(new Uri($"ws://127.0.0.1:{port}/"), CancellationToken.None);
+
+        var connection = await acceptTask;
+        Assert.NotNull(connection);
+
+        server.Shutdown();
+    }
 }

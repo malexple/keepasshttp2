@@ -6,35 +6,39 @@
 // class must be named "<Namespace>Ext". KeePassHttp2.csproj's
 // <AssemblyName> must match this - see that file.
 //
-// This is the fully-managed port of the old orchestrator/KeePassHttp2Ext.cs:
-//   - NativeCrypto (P/Invoke into a Zig DLL)   -> KeePassHttp2.Crypto.NaClBox
-//   - NativeWebSocket (P/Invoke into a Zig DLL) -> KeePassHttp2.Transport.WebSocketServer
-//   - System.Text.Json                          -> KeePassHttp2.Json (hand-rolled)
-// Protocol logic (envelope parsing, nonce replay tracking, action
-// dispatch) is unchanged from the orchestrator version.
-//
 // Lifecycle:
 //   Initialize(host) - called by KeePass at startup/plugin load. Must
 //     return quickly, so the WebSocket accept/recv loop runs on a
 //     background thread, not here.
 //   Terminate() - called at shutdown/plugin unload. Signals the loop to
-//     stop, disposes any in-flight connection (see _activeConnection
-//     below), and joins the thread with a timeout.
+//     stop, disposes any in-flight connection, and joins the thread with
+//     a timeout.
+//   GetMenuItem(PluginMenuType.Main) - adds "KeePassHttp2 Options..." to
+//     the Tools menu (the officially documented way plugins add UI entry
+//     points - see keepass.info/help/v2_dev/plg_index.html).
 //
 // Thread-safety: PwDatabase/PwEntry are not thread-safe and are owned by
 // the UI thread. All access to host.Database is marshaled onto the UI
 // thread via host.MainWindow.Invoke(...).
 //
-// _activeConnection and Terminate(): WebSocketServer.Shutdown() only
-// stops HttpListener from accepting *new* connections (verified in
-// TransportTests.Shutdown_UnblocksPendingAccept) - it does not touch an
-// already-established WebSocketConnection that a client opened and then
-// went idle on. Without this, Terminate() could hang KeePass on exit
-// whenever a browser extension connection is open but not actively
-// sending. So we track the current connection and Dispose() it here too:
-// that aborts the pending ReceiveAsync with ObjectDisposedException,
-// which WebSocketConnection.Receive() already catches and turns into a
-// clean null return, letting ServerLoop's inner loop exit on its own.
+// Crash containment: ServerLoop's per-message try/catch includes a
+// catch-all for Exception, not just our own expected exception types. An
+// unhandled exception on a background Thread (not a ThreadPool task)
+// takes down the entire process in .NET - so any bug in message handling
+// would otherwise crash the whole KeePass process, not just this plugin.
+//
+// Logging policy: keepasshttp2.log intentionally logs very little - see
+// PluginSettings.cs / the log call sites below for what's deliberately
+// excluded (URLs, full payloads, full clientIDs) and what's kept on
+// purpose (the associate/test-associate audit trail). "reject-conn"
+// covers handshakes HttpListener/WebSocketServer refused outright (bad
+// request, disallowed Origin, or a brief race during a port switch via
+// the Options dialog) - previously these left no trace at all, which
+// made a real port-switch race impossible to diagnose from the log.
+//
+// Settings: port and allowed-Origins are persisted via PluginSettings
+// (a small JSON file next to the DLL), not IPluginHost.CustomConfig - see
+// PluginSettings.cs for why.
 //
 // Trust model (change-public-keys / associate / test-associate):
 // change-public-keys is free for anyone to call - it's just an ephemeral
@@ -44,16 +48,13 @@
 // identification public key is stored in the open database's CustomData
 // (survives KeePass restarts), and test-associate on a later connection
 // just looks it up and compares - this matches how KeePassXC-Browser
-// itself does it (see keepassxc-protocol.md), including its known
-// limitation that test-associate is a plain key comparison, not a fresh
-// challenge-response proof of possession.
-//
-// associate and test-associate both always send back a real
-// success:true/false response rather than throwing - unlike most of our
-// other error paths, "no database open" and "user declined pairing" are
-// expected, common outcomes here (not protocol violations), and a real
-// client needs an actual answer instead of a silent timeout to decide
-// whether to retry, give up, or prompt the user again.
+// itself does it, including its known limitation that test-associate is
+// a plain key comparison, not a fresh challenge-response proof of
+// possession (see README - accepted, documented risk, not an oversight).
+// The optional Origin allow-list (see WebSocketServer.Accept) is a
+// separate, weaker layer: it only ever stops a real browser connecting
+// from an unexpected page, not an arbitrary local process, which can set
+// Origin to anything.
 
 using System;
 using System.Collections.Generic;
@@ -74,7 +75,6 @@ namespace KeePassHttp2;
 
 public sealed class KeePassHttp2Ext : Plugin
 {
-    private const ushort ListenPort = 19455;
     private const string ProtocolVersion = "2.0.0-stub";
     private const string CustomDataKeyPrefix = "KeePassHttp2_";
 
@@ -91,31 +91,66 @@ public sealed class KeePassHttp2Ext : Plugin
 
     public override bool Initialize(IPluginHost host)
     {
-        PluginLog.WriteLine("Initialize() called");
+        PluginLog.WriteLine("init");
         _host = host ?? throw new ArgumentNullException(nameof(host));
 
         try
         {
+            PluginSettings.Load();
             (_hostPublicKey, _hostSecretKey) = NaClBox.GenerateKeyPair();
-            PluginLog.WriteLine($"Host public key: {Convert.ToBase64String(_hostPublicKey)}");
-
-            _server = new WebSocketServer();
-            _server.Listen(ListenPort);
-            PluginLog.WriteLine($"Listening on 127.0.0.1:{ListenPort}");
-
-            _serverThread = new Thread(ServerLoop) { IsBackground = true, Name = "KeePassHttp2-Server" };
-            _serverThread.Start();
-
+            StartServer();
             return true;
         }
         catch (Exception ex)
         {
-            PluginLog.WriteLine($"Initialize FAILED: {ex}");
+            PluginLog.WriteLine($"init-failed: {ex.GetType().Name}");
             return false;
         }
     }
 
     public override void Terminate()
+    {
+        StopServer();
+    }
+
+    public override ToolStripMenuItem? GetMenuItem(PluginMenuType t)
+    {
+        if (t != PluginMenuType.Main) return null;
+
+        var menuItem = new ToolStripMenuItem { Text = "KeePassHttp2 Options..." };
+        menuItem.Click += (_, _) => ShowOptionsDialog();
+        return menuItem;
+    }
+
+    private void ShowOptionsDialog()
+    {
+        using var dialog = new OptionsDialog(PluginSettings.Port, string.Join(",", PluginSettings.AllowedOrigins));
+        if (dialog.ShowDialog(_host!.MainWindow) != DialogResult.OK) return;
+
+        bool portChanged = dialog.Port != PluginSettings.Port;
+        PluginSettings.Port = dialog.Port;
+        PluginSettings.AllowedOrigins = PluginSettings.ParseOrigins(dialog.AllowedOrigins);
+        PluginSettings.Save();
+
+        if (portChanged)
+        {
+            StopServer();
+            _stopping = false;
+            StartServer();
+        }
+    }
+
+    private void StartServer()
+    {
+        _server = new WebSocketServer();
+        _server.Listen(PluginSettings.Port);
+        PluginLog.WriteLine($"listening :{PluginSettings.Port}");
+
+        _serverThread = new Thread(ServerLoop) { IsBackground = true, Name = "KeePassHttp2-Server" };
+        _serverThread.Start();
+    }
+
+    private void StopServer()
     {
         _stopping = true;
         _server?.Shutdown();
@@ -124,43 +159,60 @@ public sealed class KeePassHttp2Ext : Plugin
         _server?.Dispose();
     }
 
+    private bool IsOriginAllowed(string? origin)
+    {
+        if (PluginSettings.AllowedOrigins.Count == 0) return true;
+        return origin is not null && PluginSettings.AllowedOrigins.Contains(origin);
+    }
+
     private void ServerLoop()
     {
         using var rng = RandomNumberGenerator.Create();
 
         while (!_stopping)
         {
-            PluginLog.WriteLine("Waiting for a connection...");
-            var connection = _server!.Accept();
+            var connection = _server!.Accept(IsOriginAllowed);
             if (_stopping) break;
-            if (connection is null) continue; // shutdown race, or a rejected non-WebSocket request
+            if (connection is null)
+            {
+                // Bad request, disallowed Origin, or a race during a
+                // port switch (see file header) - previously silent,
+                // now at least a breadcrumb in the log.
+                PluginLog.WriteLine("reject-conn");
+                continue;
+            }
 
             _activeConnection = connection;
-            PluginLog.WriteLine("Connection accepted");
+            PluginLog.WriteLine("accept");
 
             while (!_stopping)
             {
                 byte[]? raw = connection.Receive();
                 if (raw is null)
                 {
-                    PluginLog.WriteLine("connection closed");
+                    PluginLog.WriteLine("close");
                     break;
                 }
 
-                string rawJson = Encoding.UTF8.GetString(raw);
-                PluginLog.WriteLine($"received envelope: {rawJson}");
-
                 try
                 {
-                    HandleEnvelope(connection, rawJson, rng);
+                    HandleEnvelope(connection, Encoding.UTF8.GetString(raw), rng);
                 }
                 catch (EnvelopeValidationException ex)
                 {
-                    PluginLog.WriteLine($"REJECTED: {ex.Message}");
+                    PluginLog.WriteLine($"reject: {ex.Message}");
                 }
                 catch (NaClBox.CryptoException ex)
                 {
-                    PluginLog.WriteLine($"CRYPTO ERROR: {ex.Message}");
+                    PluginLog.WriteLine($"crypto-error: {ex.Message}");
+                }
+                catch (Exception ex)
+                {
+                    // Catch-all so a bug in one message can't crash the
+                    // whole KeePass process - see file header. Type name
+                    // only, no message/stack trace: those can embed
+                    // request data.
+                    PluginLog.WriteLine($"unexpected-error: {ex.GetType().Name}");
                 }
             }
 
@@ -168,6 +220,13 @@ public sealed class KeePassHttp2Ext : Plugin
             connection.Dispose();
         }
     }
+
+    // First 8 chars only - enough to tell "same client across two log
+    // lines" apart from "different client", without writing the full
+    // clientID (a random per-session value, low sensitivity, but no
+    // reason to write more of it than we need to).
+    private static string ShortId(string clientId) =>
+        clientId.Length <= 8 ? clientId : clientId.Substring(0, 8);
 
     private void HandleEnvelope(WebSocketConnection connection, string rawJson, RandomNumberGenerator rng)
     {
@@ -189,7 +248,7 @@ public sealed class KeePassHttp2Ext : Plugin
             envelope.PublicKey!, NaClBox.PublicKeyLength, "publicKey");
 
         _clientPublicKeys[envelope.ClientId!] = clientPk;
-        PluginLog.WriteLine($"stored public key for clientID={envelope.ClientId}");
+        PluginLog.WriteLine($"change-public-keys client={ShortId(envelope.ClientId!)}");
 
         string json = new JsonObjectWriter()
             .WriteString("action", "change-public-keys")
@@ -204,7 +263,7 @@ public sealed class KeePassHttp2Ext : Plugin
     private void HandleEncrypted(WebSocketConnection connection, ProtocolEnvelope envelope, RandomNumberGenerator rng)
     {
         if (!_clientPublicKeys.TryGetValue(envelope.ClientId!, out var clientPk))
-            throw new EnvelopeValidationException($"unknown clientID: {envelope.ClientId}");
+            throw new EnvelopeValidationException($"unknown clientID: {ShortId(envelope.ClientId!)}");
 
         if (_nonceTracker.IsReplay(envelope.ClientId!, envelope.Nonce!))
             throw new EnvelopeValidationException("nonce replay detected");
@@ -217,10 +276,10 @@ public sealed class KeePassHttp2Ext : Plugin
 
         string innerJson = Encoding.UTF8.GetString(plaintext);
         NaClBox.SecureZero(plaintext);
-        PluginLog.WriteLine($"decrypted inner: {innerJson}");
 
         var innerRoot = JsonParser.Parse(innerJson);
         var probe = InnerActionProbe.Parse(innerRoot);
+        PluginLog.WriteLine($"{probe.Action} client={ShortId(envelope.ClientId!)}");
 
         string innerResponseJson = probe.Action switch
         {
@@ -293,17 +352,18 @@ public sealed class KeePassHttp2Ext : Plugin
 
         if (db is null || !db.IsOpen)
         {
-            PluginLog.WriteLine("associate: no database open");
+            PluginLog.WriteLine("associate: no db open");
             return FailureResponse();
         }
 
         if (chosenName is null)
         {
-            PluginLog.WriteLine("associate: user declined pairing");
+            PluginLog.WriteLine("associate: declined");
             return FailureResponse();
         }
 
-        PluginLog.WriteLine($"associate: paired as '{chosenName}'");
+        // Deliberate audit log, not incidental leakage - see file header.
+        PluginLog.WriteLine($"associate: paired '{chosenName}'");
 
         return new JsonObjectWriter()
             .WriteString("hash", ComputeDatabaseHash(db))
@@ -345,7 +405,8 @@ public sealed class KeePassHttp2Ext : Plugin
                        CryptoBytes.ConstantTimeEquals(storedIdKey, claimedIdKey);
         }
 
-        PluginLog.WriteLine($"test-associate for id={request.Id}: {(success ? "known" : "unknown/mismatch")}");
+        // Deliberate audit log, not incidental leakage - see file header.
+        PluginLog.WriteLine($"test-associate '{request.Id}': {(success ? "ok" : "unknown")}");
 
         if (!success)
             return FailureResponse();
@@ -365,8 +426,6 @@ public sealed class KeePassHttp2Ext : Plugin
     private string HandleGetLogins(JsonValue innerRoot)
     {
         var request = GetLoginsRequest.Parse(innerRoot);
-        PluginLog.WriteLine($"get-logins for url={request.Url}");
-
         var entryFragments = new List<string>();
 
         if (!string.IsNullOrEmpty(request.Url) && Uri.TryCreate(request.Url, UriKind.Absolute, out var requestUri))
@@ -374,11 +433,7 @@ public sealed class KeePassHttp2Ext : Plugin
             _host!.MainWindow.Invoke(new MethodInvoker(() =>
             {
                 PwDatabase? db = _host.Database;
-                if (db is null || !db.IsOpen)
-                {
-                    PluginLog.WriteLine("get-logins: no database currently open");
-                    return;
-                }
+                if (db is null || !db.IsOpen) return;
 
                 foreach (var entry in db.RootGroup.GetEntries(true))
                 {
@@ -397,6 +452,10 @@ public sealed class KeePassHttp2Ext : Plugin
                 }
             }));
         }
+
+        // Intentionally not logging request.Url or match count here -
+        // that's browsing history, not something this log file should
+        // ever contain. See file header.
 
         var arrayWriter = new JsonArrayWriter();
         foreach (var fragment in entryFragments)
@@ -424,7 +483,6 @@ public sealed class KeePassHttp2Ext : Plugin
 
     private void SendJson(WebSocketConnection connection, string json)
     {
-        PluginLog.WriteLine($"sending: {json}");
         connection.Send(Encoding.UTF8.GetBytes(json));
     }
 }

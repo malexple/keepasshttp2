@@ -18,6 +18,36 @@
   </PropertyGroup>
 
   <!--
+    Reproducible builds, without pulling in the DotNet.ReproducibleBuilds
+    NuGet package (that would violate the zero-PackageReference rule
+    above - these three properties are plain MSBuild/Roslyn switches, no
+    package needed):
+
+      - Deterministic: same inputs -> byte-identical IL/metadata. On by
+        default in SDK-style projects, set explicitly so it's not
+        silently relying on a default that could change.
+      - ContinuousIntegrationBuild: strips the local machine's absolute
+        source file paths from the PDB/embedded debug info, replacing
+        them with the PathMap below. Without this, two people building
+        the same commit from different folder paths get byte-different
+        DLLs even though the code is identical.
+      - PathMap: normalizes this machine's absolute repo path to a fixed
+        token, so the mapping is the same regardless of where anyone
+        clones the repo.
+
+    To verify a build matches a published release: build with the exact
+    same .NET SDK version (see global.json) from a clean clone, then
+    compare `Get-FileHash bin\Release\net48\KeePassHttp2.dll` (PowerShell)
+    or `sha256sum` (Linux/WSL) against the SHA256SUMS published with the
+    release.
+  -->
+  <PropertyGroup>
+    <Deterministic>true</Deterministic>
+    <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+    <PathMap>$(MSBuildProjectDirectory)=/keepasshttp2/src/KeePassHttp2</PathMap>
+  </PropertyGroup>
+
+  <!--
     Required by KeePass, not optional (see keepass.info/help/v2_dev/plg_index.html,
     "Plugin Conventions"): KeePass scans the Plugins folder and uses each
     DLL's file version info Product field to decide whether it's even a

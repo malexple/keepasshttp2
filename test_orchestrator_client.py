@@ -32,7 +32,7 @@ async def main():
     client_pk, client_sk = nb.crypto_box_keypair()
     client_id = b64(os.urandom(16))
 
-    async with websockets.connect("ws://127.0.0.1:19455/", origin=ALLOWED_ORIGIN) as ws:
+    async with websockets.connect("ws://127.0.0.1:19456/", origin=ALLOWED_ORIGIN) as ws:
         # 1. change-public-keys (plaintext key exchange)
         nonce1 = os.urandom(24)
         req1 = {
