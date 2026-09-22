@@ -132,10 +132,19 @@ public sealed class WebSocketServer : IDisposable
     }
 
     // Blocks until a client completes a WebSocket handshake, or returns
-    // null if the listener was shut down, or the request was not a
-    // WebSocket upgrade (in which case we respond 400 and keep waiting -
-    // see caller's loop).
-    public WebSocketConnection? Accept()
+    // null if: the listener was shut down, the request wasn't a
+    // WebSocket upgrade (we respond 400), or isOriginAllowed rejected the
+    // request's Origin header (we respond 403). Caller's loop just keeps
+    // waiting on any of these null cases.
+    //
+    // isOriginAllowed is optional and deliberately decoupled from any
+    // specific policy - this transport class doesn't know about plugin
+    // settings, callers inject whatever check they want. Note this only
+    // ever protects against real browsers connecting from an unexpected
+    // page (browsers can't lie about their own Origin header) - it does
+    // nothing against a non-browser local process, which can set Origin
+    // to anything it wants since it's just another header it controls.
+    public WebSocketConnection? Accept(Func<string?, bool>? isOriginAllowed = null)
     {
         HttpListenerContext context;
         try
@@ -151,6 +160,13 @@ public sealed class WebSocketServer : IDisposable
         if (!context.Request.IsWebSocketRequest)
         {
             context.Response.StatusCode = 400;
+            context.Response.Close();
+            return null;
+        }
+
+        if (isOriginAllowed is not null && !isOriginAllowed(context.Request.Headers["Origin"]))
+        {
+            context.Response.StatusCode = 403;
             context.Response.Close();
             return null;
         }
