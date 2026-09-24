@@ -377,12 +377,25 @@ public sealed class KeePassHttp2Ext : Plugin
     // throwing - a client testing an association that no longer exists
     // (different database open, first connection ever, etc.) is an
     // expected, common case, not a protocol error.
+    // Always returns a normal response (success: true/false) instead of
+    // throwing - a client testing an association that no longer exists
+    // (different database open, first connection ever, etc.) is an
+    // expected, common case, not a protocol error. An empty/missing "id" in
+    // particular is the standard first-connection case (the client has no
+    // saved association yet and is proactively checking before calling
+    // associate) - only a missing "key" is an actual malformed request.
     private string HandleTestAssociate(JsonValue innerRoot)
     {
         var request = TestAssociateRequest.Parse(innerRoot);
 
-        if (string.IsNullOrEmpty(request.Id) || string.IsNullOrEmpty(request.Key))
-            throw new EnvelopeValidationException("test-associate: missing id/key");
+        if (string.IsNullOrEmpty(request.Key))
+            throw new EnvelopeValidationException("test-associate: missing key");
+
+        if (string.IsNullOrEmpty(request.Id))
+        {
+            PluginLog.WriteLine("test-associate '': unknown (no prior association)");
+            return FailureResponse();
+        }
 
         byte[] claimedIdKey = ProtocolEnvelopeParser.DecodeFixedLength(
             request.Key, NaClBox.PublicKeyLength, "test-associate.key");
